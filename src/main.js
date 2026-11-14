@@ -3,6 +3,9 @@ import './style.css';
 const app = document.querySelector('#app');
 const ROUND_SECONDS = 25;
 const POINTS = [1, 1, 3, 3, 5];
+// Empty in local development; set VITE_DATA_BASE_URL to the Cloudflare Worker URL on Vercel.
+const DATA_BASE_URL = (import.meta.env.VITE_DATA_BASE_URL || '').replace(/\/$/, '');
+const dataUrl = (file) => `${DATA_BASE_URL}/data/${file}`;
 const $ = (s) => document.querySelector(s);
 let manifest, round = 0, score = 0, seconds = ROUND_SECONDS, timer = null;
 let currentCountry = null, currentPlaces = [], aliases = [], found = new Set(), running = false;
@@ -73,7 +76,7 @@ function matchGuess(raw) {
   return best && !tied ? best : null;
 }
 async function loadManifest() {
-  const r = await fetch('/data/manifest.json');
+  const r = await fetch(dataUrl('manifest.json'));
   if (!r.ok) throw new Error('GeoNames data has not been built yet.');
   return r.json();
 }
@@ -100,9 +103,14 @@ function setText(sel, value) { $(sel).textContent = value; }
 async function beginRound() {
   if (round >= 5) return finishGame();
   currentCountry = chooseCountry(round);
-  const response = await fetch(`/data/${currentCountry.iso}.json`);
-  if (!response.ok) throw new Error(`Could not load locality data for ${currentCountry.name}.`);
-  currentPlaces = await response.json();
+  const files = currentCountry.files || [currentCountry.file || `${currentCountry.iso}.json`];
+  // Files are small enough for Cloudflare's static-assets limit.
+  const groups = await Promise.all(files.map(async (file) => {
+    const response = await fetch(dataUrl(file));
+    if (!response.ok) throw new Error(`Could not load locality data for ${currentCountry.name} (${file}).`);
+    return response.json();
+  }));
+  currentPlaces = groups.flat();
   aliases = makeAliasIndex(currentPlaces);
   found = new Set(); seconds = ROUND_SECONDS; running = true;
   setText('#round-num', `${round + 1} / 5`);
