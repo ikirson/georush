@@ -10,6 +10,9 @@ const $ = (s) => document.querySelector(s);
 let manifest, round = 0, score = 0, seconds = ROUND_SECONDS, timer = null;
 let currentCountry = null, currentPlaces = [], aliases = [], found = new Set(), running = false;
 let roundResults = [];
+let acceptedNames = new Set();
+let loadingRound = false;
+let transition = null;
 
 app.innerHTML = `
   <main class="shell">
@@ -21,59 +24,85 @@ app.innerHTML = `
       <div class="country-head"><p class="eyebrow" id="difficulty">ROUND 1 · WARM-UP</p><h2 id="country">Loading…</h2><p class="hint">Name as many cities and towns as you can.</p></div>
       <div class="globe-panel"><svg id="globe" viewBox="0 0 600 360" role="img" aria-label="Globe highlighting the current country"></svg><div class="globe-caption">THE WORLD, ONE COUNTRY AT A TIME</div></div>
       <div class="answer-row"><input id="guess" type="text" autocomplete="off" autocapitalize="words" placeholder="Type a city or town…" aria-label="Your locality guess"><button id="submit" class="guess-btn">Guess</button></div>
+      <div class="input-tools"><div class="inline-timer" aria-label="Seconds remaining"><span class="inline-timer-label">TIME LEFT</span><strong id="mobile-timer">25</strong><span class="inline-timer-unit">SEC</span></div><button id="skip" class="skip-btn" type="button" aria-label="Skip current country">Skip country <span aria-hidden="true">→</span></button></div>
       <div class="feedback-row"><span id="feedback" aria-live="polite"> </span><span id="found-count">0 found</span></div>
       <div class="round-footer"><span id="round-points">+1 POINT EACH</span><span>ENTER ↵ TO SUBMIT</span></div>
     </section>
-    <section class="end hidden" id="end"><p class="eyebrow">TODAY'S RESULT</p><h1>That's a wrap.</h1><div class="final-score"><strong id="final-score">0</strong><span>POINTS</span></div><div id="breakdown" class="breakdown"></div><button class="primary" id="again">Play again tomorrow <span>↗</span></button><p class="fine">Your score is stored only in this browser in v0.1.</p></section>
-    <footer><span>GEORUSH · V0.1</span><span>Geographical data © <a href="https://www.geonames.org/" target="_blank" rel="noreferrer">GeoNames</a> · CC BY 4.0</span></footer>
+    <section class="end hidden" id="end"><p class="eyebrow">TODAY'S RESULT</p><h1>That's a wrap.</h1><div class="final-score"><strong id="final-score">0</strong><span>POINTS</span></div><div id="breakdown" class="breakdown"></div><button class="primary" id="again">Play again tomorrow <span>↗</span></button><p class="fine">Your score is not submitted to a leaderboard yet.</p></section>
+    <footer><span>GEORUSH · V0.2</span><span>Geographical data © <a href="https://www.geonames.org/" target="_blank" rel="noreferrer">GeoNames</a> · CC BY 4.0</span></footer>
   </main>`;
 
 function normalize(s) {
   return String(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[’']/g, '').replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
 }
 function editDistance(a, b, limit) {
+  // Restricted Damerau–Levenshtein: an adjacent swapped pair is one typo.
   if (Math.abs(a.length - b.length) > limit) return limit + 1;
+  let prevPrev = null;
   let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
   for (let i = 1; i <= a.length; i++) {
-    const cur = [i]; let rowMin = i;
+    const cur = [i];
     for (let j = 1; j <= b.length; j++) {
-      cur[j] = Math.min(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
-      rowMin = Math.min(rowMin, cur[j]);
+      let d = Math.min(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      if (prevPrev && i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        d = Math.min(d, prevPrev[j - 2] + 1);
+      }
+      cur[j] = d;
     }
-    if (rowMin > limit) return limit + 1;
+    prevPrev = prev;
     prev = cur;
   }
   return prev[b.length];
 }
 function makeAliasIndex(places) {
-  const index = new Map();
+  const exact = new Map();
+  const byLength = new Map();
   for (const p of places) {
     for (const raw of p.n) {
       const n = normalize(raw);
       if (n.length < 2) continue;
-      if (!index.has(n)) index.set(n, []);
-      index.get(n).push(p.id);
+      if (!exact.has(n)) {
+        exact.set(n, []);
+        const length = n.length;
+        if (!byLength.has(length)) byLength.set(length, []);
+        byLength.get(length).push(n);
+      }
+      const ids = exact.get(n);
+      if (!ids.includes(p.id)) ids.push(p.id);
     }
   }
-  return index;
+  return { exact, byLength };
 }
 function matchGuess(raw) {
   const q = normalize(raw);
-  if (!q || q.length < 2) return null;
-  const exact = aliases.get(q);
-  if (exact) return exact.find(id => !found.has(id)) ? exact.find(id => !found.has(id)) : null;
-  const limit = q.length >= 10 ? 2 : q.length >= 5 ? 1 : 0;
-  if (!limit) return null;
-  let best = null, bestDist = limit + 1, tied = false;
-  for (const [name, ids] of aliases) {
-    if (Math.abs(name.length - q.length) > limit) continue;
-    const d = editDistance(q, name, limit);
-    if (d < bestDist) {
-      const available = ids.find(id => !found.has(id));
-      if (available) { best = available; bestDist = d; tied = false; }
-    } else if (d === bestDist && ids.some(id => !found.has(id))) tied = true;
+  if (!q || q.length < 2) return { id: null, reason: 'invalid' };
+  if (acceptedNames.has(q)) return { id: null, reason: 'duplicate' };
+  const exact = aliases.exact.get(q);
+  if (exact) {
+    const available = exact.find(id => !found.has(id));
+    return available ? { id: available, name: q } : { id: null, reason: 'duplicate' };
   }
-  return best && !tied ? best : null;
+  // No fuzzy acceptance for very short names; strict tolerance elsewhere.
+  const limit = q.length >= 10 ? 2 : q.length >= 5 ? 1 : 0;
+  if (!limit) return { id: null, reason: 'not-found' };
+  let best = null, bestDist = limit + 1, tied = false;
+  for (let length = q.length - limit; length <= q.length + limit; length++) {
+    for (const name of aliases.byLength.get(length) || []) {
+      const d = editDistance(q, name, limit);
+      if (d > bestDist) continue;
+      const available = aliases.exact.get(name).find(id => !found.has(id));
+      if (!available) continue;
+      if (d < bestDist) {
+        best = { id: available, name };
+        bestDist = d;
+        tied = false;
+      } else if (d === bestDist && available !== best?.id) {
+        // Multiple different localities at the same edit distance: don't guess.
+        tied = true;
+      }
+    }
+  }
+  return best && !tied ? best : { id: null, reason: 'not-found' };
 }
 async function loadManifest() {
   const r = await fetch(dataUrl('manifest.json'));
@@ -85,26 +114,45 @@ function seededIndex(seed, length) {
   for (const c of seed) { h ^= c.charCodeAt(0); h = Math.imul(h, 16777619); }
   return (h >>> 0) % length;
 }
+// Curated geographic difficulty, rather than ranking countries by the number of
+// GeoNames records. Only the sovereign-country codes listed here appear in rounds.
+// Group 0/1: 1 point, group 2/3: 3 points, group 4: 5 points.
+// These are editorial starting points to refine using actual player results.
+const COUNTRY_POOLS = [
+  'US GB FR CA DE AU IT ES JP BR MX IN CN',
+  'AR NZ IE NL CH AT PT GR TR KR RU ZA EG TH ID',
+  'SE NO DK FI PL CZ HU BE CL CO PE IL AE SA MA KE NG MY PH VN',
+  'RO BG HR RS UA GE AM AZ UY CR PA EC TN DZ GH ET TZ UG NP LK JO LB',
+  'KG TJ UZ TM MN BT LA KH MM BD PK AF IQ OM YE SY SD SS TD NE ML BF BJ TG GN GW SL LR MR CF CD CG GA GQ AO MZ MW ZM ZW NA BW LS SZ RW BI DJ ER SO MG MU FJ PG SB VU WS TO KI FM PW MH'
+].map(pool => pool.split(' '));
 function chooseCountry(roundIndex) {
-  const countries = manifest.countries.filter(c => c.count >= 5).sort((a,b) => b.count-a.count);
-  const n = countries.length;
-  const ranges = [ [0, .2], [.2, .4], [.4, .6], [.6, .8], [.8, 1] ];
-  const [lo, hi] = ranges[roundIndex];
-  let start = Math.floor(n * lo), end = Math.max(start + 1, Math.floor(n * hi));
-  let pool = countries.slice(start, end);
-  if (!pool.length) pool = countries.slice(-Math.min(10, n));
-  const day = new Date().toISOString().slice(0,10);
-  let idx = seededIndex(`${day}-round-${roundIndex}`, pool.length);
-  let chosen = pool[idx];
-  for (let tries=0; roundResults.some(x => x.iso === chosen.iso) && tries < pool.length; tries++) chosen = pool[(idx + tries + 1) % pool.length];
-  return chosen;
+  const eligible = new Map(manifest.countries.filter(c => c.count >= 5).map(c => [c.iso, c]));
+  const used = new Set(roundResults.map(result => result.iso));
+  const pool = COUNTRY_POOLS[roundIndex].map(iso => eligible.get(iso)).filter(c => c && !used.has(c.iso));
+  if (!pool.length) throw new Error(`No eligible countries available for round ${roundIndex + 1}.`);
+  const day = new Date().toISOString().slice(0, 10);
+  return pool[seededIndex(`${day}-round-${roundIndex}-v02`, pool.length)];
 }
 function setText(sel, value) { $(sel).textContent = value; }
+function updateTimer() {
+  setText('#timer', seconds);
+  setText('#mobile-timer', seconds);
+  $('#timer').classList.toggle('urgent', seconds <= 5);
+  $('#mobile-timer').classList.toggle('urgent', seconds <= 5);
+}
 async function beginRound() {
-  if (round >= 5) return finishGame();
+  if (round >= POINTS.length) return finishGame();
+  loadingRound = true;
+  running = false;
+  clearInterval(timer);
+  clearTimeout(transition);
+  $('#guess').disabled = true;
+  $('#submit').disabled = true;
+  $('#skip').disabled = true;
   currentCountry = chooseCountry(round);
+  setText('#country', currentCountry.name);
+  setText('#feedback', 'Loading localities…');
   const files = currentCountry.files || [currentCountry.file || `${currentCountry.iso}.json`];
-  // Files are small enough for Cloudflare's static-assets limit.
   const groups = await Promise.all(files.map(async (file) => {
     const response = await fetch(dataUrl(file));
     if (!response.ok) throw new Error(`Could not load locality data for ${currentCountry.name} (${file}).`);
@@ -112,47 +160,66 @@ async function beginRound() {
   }));
   currentPlaces = groups.flat();
   aliases = makeAliasIndex(currentPlaces);
-  found = new Set(); seconds = ROUND_SECONDS; running = true;
-  setText('#round-num', `${round + 1} / 5`);
-  setText('#timer', seconds);
-  setText('#country', currentCountry.name);
+  found = new Set();
+  acceptedNames = new Set();
+  seconds = ROUND_SECONDS;
+  setText('#round-num', `${round + 1} / ${POINTS.length}`);
+  updateTimer();
   setText('#difficulty', `ROUND ${round + 1} · ${['WARM-UP','GETTING WARM','MIDPOINT','CHALLENGE','FINAL ROUND'][round]}`);
   setText('#round-points', `+${POINTS[round]} POINT${POINTS[round] > 1 ? 'S' : ''} EACH`);
   setText('#found-count', '0 found'); setText('#feedback', ' ');
-  $('#guess').value = ''; $('#guess').disabled = false; $('#submit').disabled = false;
+  $('#guess').value = '';
   $('#progress').style.width = `${round * 20}%`;
   drawGlobe(currentCountry.numeric);
+  $('#guess').disabled = false;
+  $('#submit').disabled = false;
+  $('#skip').disabled = false;
+  loadingRound = false;
+  running = true;
   $('#guess').focus();
-  clearInterval(timer);
+  // Reset the timer on entry; skipping starts the next round as soon as it loads.
   timer = setInterval(() => {
-    seconds--; setText('#timer', seconds);
-    if (seconds <= 5) $('#timer').classList.add('urgent');
-    if (seconds <= 0) endRound();
+    if (!running) return;
+    seconds = Math.max(0, seconds - 1);
+    updateTimer();
+    if (seconds === 0) endRound(false);
   }, 1000);
 }
 function submitGuess() {
   if (!running) return;
   const input = $('#guess'); const value = input.value.trim();
   if (!value) return;
-  const id = matchGuess(value);
-  if (id) {
-    found.add(id); score += POINTS[round];
+  const match = matchGuess(value);
+  if (match.id != null) {
+    found.add(match.id);
+    acceptedNames.add(normalize(value));
+    score += POINTS[round];
     setText('#score', score); setText('#found-count', `${found.size} found`);
     setText('#feedback', `✓ ${value}`); $('#feedback').className = 'good';
     setText('#gain', `+${POINTS[round]}`); $('#gain').classList.remove('pop'); void $('#gain').offsetWidth; $('#gain').classList.add('pop');
     input.value = '';
   } else {
-    setText('#feedback', 'Not found — try another spelling'); $('#feedback').className = 'neutral';
+    setText('#feedback', match.reason === 'duplicate' ? 'Already guessed' : 'Not found — try another spelling');
+    $('#feedback').className = 'neutral';
     input.select();
   }
 }
-function endRound() {
-  if (!running) return;
-  running = false; clearInterval(timer); $('#timer').classList.remove('urgent');
-  $('#guess').disabled = true; $('#submit').disabled = true;
+function endRound(skipped = false) {
+  if (!running || loadingRound) return;
+  running = false;
+  clearInterval(timer);
+  $('#guess').disabled = true;
+  $('#submit').disabled = true;
+  $('#skip').disabled = true;
   roundResults.push({ name: currentCountry.name, iso: currentCountry.iso, found: found.size, count: currentCountry.count, points: found.size * POINTS[round] });
-  round++; setText('#feedback', 'Round complete'); $('#feedback').className = 'neutral';
-  setTimeout(() => beginRound().catch(showError), 1300);
+  round++;
+  if (skipped) {
+    // No countdown or transition: start loading the next country immediately.
+    beginRound().catch(showError);
+  } else {
+    setText('#feedback', 'Round complete'); $('#feedback').className = 'neutral';
+    transition = setTimeout(() => beginRound().catch(showError), 900);
+  }
 }
 function finishGame() {
   clearInterval(timer); $('#game').classList.add('hidden'); $('#end').classList.remove('hidden');
@@ -188,5 +255,6 @@ $('#start').addEventListener('click', async () => {
   catch (e) { showError(e); }
 });
 $('#submit').addEventListener('click', submitGuess);
+$('#skip').addEventListener('click', () => endRound(true));
 $('#guess').addEventListener('keydown', e => { if(e.key==='Enter') submitGuess(); });
 $('#again').addEventListener('click', () => { $('#end').classList.add('hidden'); $('#intro').classList.remove('hidden'); });
