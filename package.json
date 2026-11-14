@@ -1,0 +1,13 @@
+{
+  "name": "georush-v0-1",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "data:build": "python scripts/build_geonames.py"
+  },
+  "devDependencies": { "vite": "^6.1.0" }
+}
