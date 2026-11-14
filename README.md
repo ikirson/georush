@@ -1,4 +1,4 @@
-# GeoRush v0.1
+# GeoRush v0.1 (this is an AI-generated game, not a project I've created)
 
 A five-round daily locality game. This is the first implementation foundation, not yet a public competitive release.
 
